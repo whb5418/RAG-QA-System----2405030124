@@ -1,7 +1,8 @@
 import os
 from langchain_ollama import ChatOllama
-from langchain.chains import ConversationalRetrievalChain
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 from knowledge_base import KnowledgeBase
 
 DEFAULT_SYSTEM_PROMPT = """你是一个专业的智能问答助手，专门基于提供的参考文档回答用户问题。
@@ -9,25 +10,12 @@ DEFAULT_SYSTEM_PROMPT = """你是一个专业的智能问答助手，专门基�
 重要规则：
 1. 如果提供的参考文档中包含与问题相关的信息，请基于这些信息进行回答
 2. 如果参考文档中没有包含与问题相关的内容，请明确回答："文档中未找到相关答案"
-3. 请在回答时适当引用参考文档的内容，并在最后说明答案的来源
+3. 请在回答时适当引用参考文档的内容
 4. 回答要准确、简洁、有条理
-5. 如果需要使用外部知识来补充回答，请明确说明这是基于外部知识而非文档内容
 
 参考文档：
 {context}
-
-当前问题：{question}
-
-回答："""
-
-DEFAULT_QUESTION_PROMPT = """请根据以下参考文档回答问题。如果文档中没有相关信息，请明确说明。
-
-参考文档：
-{context}
-
-问题：{question}
-
-回答："""
+"""
 
 class RAGQASystem:
     def __init__(
@@ -35,13 +23,11 @@ class RAGQASystem:
         llm_model="deepseek-r1:7b",
         temperature=0.7,
         system_prompt=None,
-        question_prompt=None,
         persist_directory="chromadb_store"
     ):
         self.llm_model = llm_model
         self.temperature = temperature
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-        self.question_prompt = question_prompt or DEFAULT_QUESTION_PROMPT
 
         self.llm = ChatOllama(
             model=llm_model,
@@ -60,19 +46,14 @@ class RAGQASystem:
 
         retriever = self.knowledge_base.get_retriever(search_kwargs={"k": 3})
 
-        combine_docs_prompt = PromptTemplate(
-            template=self.question_prompt,
-            input_variables=["context", "question"]
-        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", self.system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}")
+        ])
 
-        self.qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
-            retriever=retriever,
-            combine_docs_chain_kwargs={"prompt": combine_docs_prompt},
-            memory=None,
-            return_source_documents=True,
-            verbose=False
-        )
+        question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
+        self.qa_chain = create_retrieval_chain(retriever, question_answer_chain)
 
     def ask(self, question, use_history=True):
         if self.qa_chain is None:
@@ -80,19 +61,20 @@ class RAGQASystem:
 
         if use_history:
             result = self.qa_chain({
-                "question": question,
+                "input": question,
                 "chat_history": self.chat_history
             })
-            self.chat_history.append((question, result["answer"]))
+            self.chat_history.append(("human", question))
+            self.chat_history.append(("ai", result["answer"]))
         else:
             result = self.qa_chain({
-                "question": question,
+                "input": question,
                 "chat_history": []
             })
 
         return {
             "answer": result["answer"],
-            "source_documents": result.get("source_documents", []),
+            "source_documents": result.get("context", []),
             "chat_history": self.chat_history if use_history else []
         }
 
